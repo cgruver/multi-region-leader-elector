@@ -5,11 +5,9 @@ import javax.ws.rs.core.Response;
 
 import org.labmonkeys.elector.VoterApp;
 import org.labmonkeys.elector.api.VoterApi;
-import org.labmonkeys.elector.dto.StatusDto;
 import org.labmonkeys.elector.dto.VoterDto;
 import org.labmonkeys.elector.dto.VoterDto.VoterRole;
 import org.labmonkeys.elector.mapper.VoterMapper;
-import org.labmonkeys.elector.model.Voter;
 
 public class VoterService implements VoterApi {
 
@@ -20,30 +18,23 @@ public class VoterService implements VoterApi {
     VoterMapper voterMapper;
 
     @Override
-    public Response heartBeat(StatusDto status) {
-        // TODO Auto-generated method stub
-        return null;
+    public Response heartBeat(VoterDto dto) {
+        return Response.ok(this.voterMapper.voterToDto(voterApp.getMe())).build();
     }
 
     @Override
     public Response registerVoter(VoterDto dto) {
-        voterApp.updateVoter(voterMapper.dtoToVoter(dto));
-        StatusDto status = new StatusDto();
-        status.setSender(this.voterMapper.voterToDto(voterApp.getVoter()));
-        status.setKnownVoters(this.voterMapper.votersToDtos(voterApp.getVoters()));
-        return Response.ok(status).build();
+        voterApp.updateVoter(dto);
+        return Response.ok(this.voterMapper.voterToDto(voterApp.getMe())).build();
     }
 
     @Override
     public Response removeVoter(VoterDto dto) {
-        Voter voter = voterApp.getVoters().get(dto.getVoterId());
-        voter.setMissedHeartBeats(0);
-        voter.setRole(VoterRole.NONE);
-        voter.setOnLine(false);
-        voterApp.updateVoter(voter);
-        StatusDto status = new StatusDto();
-        status.setSender(this.voterMapper.voterToDto(voterApp.getVoter()));
-        status.setKnownVoters(this.voterMapper.votersToDtos(voterApp.getVoters()));
-        return Response.ok(status).build();
+        dto.setOnLine(false);
+        dto.setRole(VoterRole.NONE);
+        voterApp.updateVoter(dto);
+        voterApp.resetHeartbeat(dto.getVoterId());
+        return Response.ok(this.voterMapper.voterToDto(voterApp.getMe())).build();
     }
+
 }

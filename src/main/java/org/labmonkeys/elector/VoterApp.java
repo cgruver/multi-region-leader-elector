@@ -15,14 +15,10 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.eclipse.microprofile.rest.client.RestClientBuilder;
 import org.jboss.logging.Logger;
 import org.labmonkeys.elector.api.VoterApi;
-import org.labmonkeys.elector.dto.StatusDto;
 import org.labmonkeys.elector.dto.VoterDto;
 import org.labmonkeys.elector.dto.VoterDto.VoterRole;
-import org.labmonkeys.elector.mapper.VoteMapper;
 import org.labmonkeys.elector.mapper.VoterMapper;
-import org.labmonkeys.elector.model.Election;
 import org.labmonkeys.elector.model.Voter;
-
 import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.runtime.StartupEvent;
 import io.quarkus.scheduler.Scheduled;
@@ -33,11 +29,13 @@ public class VoterApp {
     
     private final Logger LOG = Logger.getLogger(VoterApp.class);
 
-    @Inject VoterMapper voterMapper;
+    @Inject
+    ElectionApp election;
 
-    @Inject VoteMapper voteMapper;
+    @Inject
+    VoterMapper voterMapper;
 
-    @ConfigProperty(name = "leader-elector.other-voters")
+    @ConfigProperty(name = "leader-elector.voter-list")
     private List<Voter> voterList;
 
     @ConfigProperty(name = "leader-elector.voter-url")
@@ -46,31 +44,30 @@ public class VoterApp {
     @ConfigProperty(name = "leader-elector.voter-id")
     private String voterId;
 
-    @ConfigProperty(name = "leader-elector.heartbeat")
+    @ConfigProperty(name = "leader-elector.heartbeat-interval")
     private String heartbeatInterval;
+
+    @ConfigProperty(name = "leader-elector.missed-heartbeat-tolerance")
+    private Integer missedHbTolerance;
 
     @Getter
     Map<String, Voter> voters;
 
     @Getter
-    Voter voter;
+    Voter me;
     
-    private boolean electionInProgress;
-
-    private Election currentElection;
-
     private Integer quorum;
 
     void startUp(@Observes StartupEvent startupEvent) {
 
-        this.voter = new Voter();
-        this.voter.setVoterId(this.voterId);
-        this.voter.setVoterUrl(this.voterUrl);
-        this.voter.setRole(VoterRole.NONE);
-        this.voter.setMissedHeartBeats(0);
+        this.me = new Voter();
+        this.me.setVoterId(this.voterId);
+        this.me.setVoterUrl(this.voterUrl);
+        this.me.setRole(VoterRole.NONE);
+        this.me.setMissedHeartBeats(0);
+        this.me.setOnLine(true);
         this.voters = Collections.synchronizedMap(new HashMap<String, Voter>());
-        this.electionInProgress = false;
-        this.currentElection = new Election();
+        this.election.electionInProgress = false;
         for (Voter voter : this.voterList) {
             voter.setMissedHeartBeats(0);
             voter.setRole(VoterRole.NONE);
@@ -85,7 +82,7 @@ public class VoterApp {
         for (Voter voter : this.voters.values()) {
             VoterApi voterApi = RestClientBuilder.newBuilder().baseUri(URI.create(voter.getVoterUrl())).build(VoterApi.class);
             try {
-                voterApi.removeVoter(voterMapper.voterToDto(this.voter));
+                voterApi.removeVoter(voterMapper.voterToDto(this.me));
             } catch (Exception e) {
                 LOG.info("Exception Thrown: " + e.getMessage());
                 LOG.info("Continue Shutdown");
@@ -93,13 +90,17 @@ public class VoterApp {
         }
     }
     
-    @Scheduled(every = "{leader-elector.heartbeat}")
+    @Scheduled(every = "{leader-elector.heartbeat-interval}")
     void scheduledTasks() {
 
-        if (this.voter.getRole() == VoterRole.NONE) {
+        if (this.me.getRole() == VoterRole.NONE) {
             this.bootStrap();
         } else {
-            this.sendHeartBeat();
+            for (Voter knownVoter : this.voters.values()) {
+                URI uri = URI.create(knownVoter.getVoterUrl());
+                VoterApi voterApi = RestClientBuilder.newBuilder().baseUri(uri).build(VoterApi.class);
+                this.sendHeartBeat(voterApi, knownVoter);
+            }
             this.healthCheck();
         }
     }
@@ -109,58 +110,107 @@ public class VoterApp {
             Response response = null;
             VoterApi voterApi = RestClientBuilder.newBuilder().baseUri(URI.create(voter.getVoterUrl())).build(VoterApi.class);
             try {
-                response = voterApi.registerVoter(voterMapper.voterToDto(this.voter));
+                response = voterApi.registerVoter(voterMapper.voterToDto(this.me));
                 if ( response.getStatus() == 200 ) {
-                    StatusDto status = response.readEntity(StatusDto.class);
-                    LOG.info("Registration Response received from: " + status.getSender().getVoterId());
-                    this.processStatus(status);
+                    VoterDto sender = response.readEntity(VoterDto.class);
+                    LOG.info("Registration Response received from: " + sender.getVoterId());
+                    this.updateVoter(sender);
+                    this.resetHeartbeat(sender.getVoterId());
                 } else {
                     LOG.info("Bootstrap: No Status Received.  Continue Bootstrap.");
                 }
             } catch (Exception e) {
-                LOG.info("Exception Thrown: " + e.getMessage());
+                LOG.error("Exception Thrown: " + e.getMessage());
                 LOG.info("Continue Bootstrap.");
+            }
+        }
+        // Check For Quorum and set my VoterRole
+        if (this.checkQuorum()) {
+            boolean activeLeader = false;
+            if (me.getRole() != VoterRole.LEADER) {
+                for (Voter voter : this.voters.values()) {
+                    if (voter.getRole() == VoterRole.LEADER && voter.isOnLine()) {
+                        me.setRole(VoterRole.FOLLOWER);
+                        activeLeader = true;
+                    }
+                }
+            } else {
+                activeLeader = true;
+            }
+            if (!activeLeader) {
+                this.election.callForElection();
             }
         }
     }
 
-    private void sendHeartBeat() {
-        StatusDto status = new StatusDto();
-        status.setSender(voterMapper.voterToDto(this.voter));
-        status.setKnownVoters(voterMapper.votersToDtos(this.voters));
-
-        for (Voter knownVoter : this.voters.values()) {
-            Response response = null;
-            URI uri = URI.create(knownVoter.getVoterUrl());
-            VoterApi voterApi = RestClientBuilder.newBuilder().baseUri(uri).build(VoterApi.class);
-            try {
-                response = voterApi.heartBeat(status);
-                if ( response.getStatus() == 200 ) {
-                    StatusDto hbStatus = response.readEntity(StatusDto.class);
-
-                } else {
-                    
-                }
-            } catch (Exception e) {
-                //TODO: handle exception
+    private void sendHeartBeat(VoterApi voterApi, Voter knownVoter) {
+        Response response = null;
+        try {
+            response = voterApi.heartBeat(voterMapper.voterToDto(this.me));
+            if ( response.getStatus() == 200 ) {
+                VoterDto sender = response.readEntity(VoterDto.class);
+                LOG.info("Heartbeat Response received from: " + sender.getVoterId());
+                this.updateVoter(sender);
+                this.resetHeartbeat(sender.getVoterId());
+            } else {
+                LOG.info("Received response code: " + response.getStatus() + "From Voter: " + knownVoter.getVoterId());
+                knownVoter.setMissedHeartBeats(knownVoter.getMissedHeartBeats() + 1);
+                this.voters.put(knownVoter.getVoterId(), knownVoter);
             }
+        } catch (Exception e) {
+            LOG.info("Caught exception: " + e.getMessage() + " On heartbeat from Voter: " + knownVoter.getVoterId());
+            knownVoter.setMissedHeartBeats(knownVoter.getMissedHeartBeats() + 1);
+            this.voters.put(knownVoter.getVoterId(), knownVoter);
         }
     }
 
     private void healthCheck() {
-
-
-    }
-
-    private void processStatus(StatusDto status) {
-        for (VoterDto dto : status.getKnownVoters().values()) {
-            
+        for (Voter voter : this.voters.values()) {
+            if (voter.getMissedHeartBeats() >= this.missedHbTolerance) {
+                voter.setOnLine(false);
+                this.voters.put(voter.getVoterId(), voter);
+                if (voter.getRole() == VoterRole.LEADER) {
+                    // The leader may be down, or I may be down.  Check to see if an election is necessary.
+                    if (checkQuorum()) {
+                        this.election.callForElection();
+                    } else {
+                        // I lost Quorum.  I may be offline or isolated, so go back to bootstrap mode.
+                        me.setRole(VoterRole.NONE);
+                    }
+                }
+            }
         }
     }
 
-    public void updateVoter(Voter voter) {
-        voter.setMissedHeartBeats(this.voters.get(voter.getVoterId()).getMissedHeartBeats());
-        this.voters.put(voter.getVoterId(), voter);
+    public void updateVoter(VoterDto dto) {
+        Voter voterUpdate = this.voters.get(dto.getVoterId());
+        voterUpdate.setOnLine(dto.isOnLine());
+        voterUpdate.setRole(dto.getRole());
+        this.voters.put(voterUpdate.getVoterId(), voterUpdate);
     }
 
+    public void resetHeartbeat(String voterId) {
+        Voter voterUpdate = this.voters.get(voterId);
+        voterUpdate.setMissedHeartBeats(0);
+        voterUpdate.setOnLine(true);
+        this.voters.put(voterId, voterUpdate);
+    }
+
+    private boolean checkQuorum() {
+
+        Integer onLineVoters = 0;
+        if (me.isOnLine()) {
+            onLineVoters++;
+        }
+        for (Voter voter : this.voters.values()) {
+            if (voter.isOnLine()) {
+                onLineVoters++;
+            }
+        }
+        if (onLineVoters >= this.quorum) {
+            return true;
+        } else {
+            return false;
+        }
+    }
 }

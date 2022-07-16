@@ -12,7 +12,6 @@ import javax.ws.rs.core.Response;
 
 import org.eclipse.microprofile.rest.client.inject.RegisterRestClient;
 import org.labmonkeys.elector.dto.VoteDto;
-import org.labmonkeys.elector.dto.VoterDto;
 
 @ApplicationScoped
 @ApplicationPath("/voter/election")
@@ -22,7 +21,7 @@ public interface LeaderElectionApi {
     @POST
     @Path("/start")
     @Produces(MediaType.APPLICATION_JSON)
-    public Response startElection(VoterDto voter);
+    public Response startElection();
 
     @POST
     @Path("/cast")

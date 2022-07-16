@@ -1,6 +1,7 @@
 leader-elector:
   voter-url: ${VOTER_URL}
-  voter-id: ${SEED_URL}
-  other-voters: ${OTHER_VOTERS}
-  heartbeat: 30s
-  grace-period: 40s
+  voter-id: ${VOTER_ID}
+  voter-list: ${OTHER_VOTERS}
+  heartbeat-interval: 30s
+  missed-heartbeat-tolerance: 2
+
